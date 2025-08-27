@@ -187,7 +187,6 @@ def call_openai_json_map(api_key: str, mapping: Dict[str, str]) -> Dict[str, str
             {"role": "user", "content": PROMPT_HTML_JSON},
             {"role": "user", "content": json.dumps(mapping, ensure_ascii=False)},
         ],
-        temperature=0.2,
     )
     content = resp.choices[0].message.content or "{}"
     return _safe_json_loads(content)
@@ -201,7 +200,6 @@ def call_openai_rewrite_text(api_key: str, text: str) -> str:
             {"role": "user", "content": PROMPT_PLAIN_TEXT},
             {"role": "user", "content": text},
         ],
-        temperature=0.2,
     )
     return (resp.choices[0].message.content or "").strip()
 
@@ -214,7 +212,6 @@ def call_openai_rewrite_text_to_html(api_key: str, text: str) -> str:
             {"role": "user", "content": PROMPT_PLAIN_TO_HTML},
             {"role": "user", "content": text},
         ],
-        temperature=0.2,
     )
     return (resp.choices[0].message.content or "").strip()
 
