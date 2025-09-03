@@ -99,7 +99,7 @@ def append_words_marker_to_html(html: str, n: int) -> str:
 # ----------------------------
 # Промпты
 # ----------------------------
-# 1) Обычный текст → возвращаем ОТРЕДАКТИРОВАННЫЙ ТЕКСТ с [Words: N] в конце
+# 1) Обычный текст → отредактированный текст (+[Words: N]).
 PROMPT_PLAIN_TEXT = """Task: Edit the text so it reads naturally and fluently for a native speaker while preserving the original meaning, structure, and tone.
 Language: Use the SAME language as the input text (auto-detect). Do NOT translate. Preserve the original dialect/orthography (e.g., en-GB vs en-US).
 Requirements:
@@ -108,7 +108,7 @@ Requirements:
 - Formatting: keep punctuation, quotation marks, inline formatting (bold/italic/links/code), emojis, citation markers, and references exactly as they are.
 - Facts & entities: do not add, remove, or alter information. Keep names, numbers, dates, URLs, and titles unchanged.
 - Tone & register: preserve the author’s voice, level of formality, and rhetorical stance.
-- Style tweaks: replace awkward phrasing with idiomatic expressions, reduce repetitiveness, vary sentence length, and simplify clunky constructions—without changing emphasis or intent.
+- Style tweaks: replace awkward phrasing with idiomatic expressions, reduce repetitiveness, vary sentence length for burstiness (mix short and long sentences), and simplify clunky constructions—without changing emphasis or intent. Increase perplexity by using unexpected but natural phrasing, contractions (e.g., don't instead of do not), colloquialisms, and varied vocabulary to avoid predictable patterns.
 - Non-text elements (code, formulas, tables): leave unchanged.
 - If perfect word-count preservation would hurt clarity or grammar, prefer clarity but stay as close as possible to the target range.
 - Return ONLY the edited text—no explanations, no metadata (besides [Words: N]), no code fences.
@@ -122,7 +122,7 @@ Requirements:
 - Keep the same paragraph breaks, headings, list order/numbering, and overall section order as in the input. Convert them to equivalent HTML structure.
 - Preserve punctuation, quotation marks, inline emphasis/links/code semantics; convert inline formatting markers to their HTML equivalents (<strong>/<em>/<a>/<code>).
 - Do not add, remove, or alter facts, names, numbers, dates, URLs, or titles.
-- Preserve the author’s voice and register; improve fluency without changing intent.
+- Preserve the author’s voice and register; improve fluency without changing intent. Vary sentence length for burstiness (mix short and long), increase perplexity with unexpected natural phrasing, use contractions, idioms, and varied vocab to mimic human writing and avoid AI detection patterns.
 - If the edited content contains at least one <table>, INCLUDE at the very top of the output a SINGLE <style> block:
   <style>
   table { border-collapse: collapse; }
@@ -147,8 +147,8 @@ Requirements (APPLY PER VALUE):
 - Do not add, remove, or alter facts, names, numbers, dates, URLs, or titles.
 - Preserve the author’s voice and register.
 - Absolutely do NOT introduce or remove HTML tags; you are editing TEXT CONTENT ONLY.
-
-Output: Respond with ONLY a valid JSON object with the SAME KEYS and improved string values. No comments, no code fences, no extra text, no explanations. Ensure the output is parseable as JSON.
+- Improve fluency by varying sentence length for burstiness (mix short/long), increasing perplexity with unexpected natural phrasing, using contractions, idioms, and varied vocabulary to avoid predictable AI patterns.
+- Return ONLY a valid JSON object with the SAME KEYS and improved string values. No comments, no code fences, no extra text, no explanations. Ensure the output is parseable as JSON.
 """
 # ----------------------------
 # Работа с моделями
