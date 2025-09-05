@@ -1,10 +1,5 @@
-streamlit>=1.37.1
-beautifulsoup4>=4.12.3
-lxml>=5.3.0  # Parser for BeautifulSoup
-anthropic>=0.34.2  # For Claude API integration
-
-# Optional: For .docx support
-python-docx>=1.1.2
-
-# Optional: For .doc (.doc) support (requires additional system dependencies like antiword or similar)
-textract-py3>=2.1.1
+streamlit>=1.35
+openai>=1.35
+beautifulsoup4>=4.12
+lxml>=5.2
+python-docx>=1.1
