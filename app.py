@@ -1,24 +1,10 @@
 from __future__ import annotations
 
-"""
-Streamlit Humanizer (stability & realism pass)
-- Надёжная JSON-обработка (response_format="json_object")
-- Батчинг текстовых узлов HTML (по символам)
-- Контролируемая вариативность (температура, top_p, частотные штрафы)
-- Опциональный маркер [Words: N]
-- Исправлены мелкие баги (в т.ч. случайный символ 'ё')
-- Доп. контекст для HTML-узлов (родительский тег)
-
-⚠️ Эти инструменты предназначены для улучшения естественности текста, а не для нарушения академической честности.
-"""
-
 import io
 import json
-import math
 import re
 import tempfile
-from dataclasses import dataclass
-from typing import Dict, Iterable, Iterator, List, Tuple
+from typing import Dict, Tuple
 
 import streamlit as st
 from bs4 import BeautifulSoup, NavigableString, Tag
@@ -35,72 +21,38 @@ try:
 except Exception:
     textract = None
 
-import os
-
 # ----------------------------
 # Ключ и модель из Streamlit Secrets / окружения
 # ----------------------------
-API_KEY_DEFAULT = st.secrets.get("OPENAI_API_KEY") or os.getenv("OPENAI_API_KEY", "")
-MODEL_DEFAULT   = st.secrets.get("OPENAI_MODEL") or os.getenv("OPENAI_MODEL", "gpt-5")
+import os
+
+API_KEY  = st.secrets.get("OPENAI_API_KEY") or os.getenv("OPENAI_API_KEY", "")
+MODEL_ID = st.secrets.get("OPENAI_MODEL", os.getenv("OPENAI_MODEL", "gpt-5"))
 
 # ----------------------------
 # Оформление
 # ----------------------------
-st.set_page_config(page_title="Humanizer — стабильная версия", page_icon="🛠️", layout="wide")
-st.title("🛠️ Humanizer с сохранением структуры — стабильная версия")
-
-st.caption(
-    "Повышенная устойчивость: JSON-mode, батчинг длинных HTML, контроль вариативности, исправления багов."
-)
+st.set_page_config(page_title="Humanizer — сохранение структуры", page_icon="🛠️", layout="wide")
+st.title("🛠️ Humanizer с сохранением структуры")
 
 # ----------------------------
 # Хелперы
 # ----------------------------
-
 def is_html(text: str) -> bool:
     if not text:
         return False
-    # Быстрый ранний тест по угловым скобкам
-    if "</" in text or "/>" in text or re.search(r"<([a-zA-Z][^>]*?)>", text):
-        return True
-    # Фолбэк через парсер
-    soup = BeautifulSoup(text, "lxml")
-    return bool(soup.find())
+    has_tag = bool(re.search(r"<([a-zA-Z][^>]*?)>", text))
+    has_angle = "</" in text or "/>" in text
+    return has_tag and has_angle
 
-
-def _word_count(s: str) -> int:
-    tokens = re.findall(r"\w+", s, flags=re.UNICODE)
-    return len(tokens)
-
-
-def append_words_marker_to_html(html: str, n: int) -> str:
-    try:
-        soup = BeautifulSoup(html, "lxml")
-        container = soup.body or soup
-        p = soup.new_tag("p")
-        p.string = f"[Words: {n}]"
-        container.append(p)
-        return str(soup)
-    except Exception:
-        return f"{html}\n[Words: {n}]"
-
-
-# ------------ HTML разметка → маркировка текстовых узлов -------------
-@dataclass
-class NodeInfo:
-    text: str
-    parent_tag: str
-
-
-def extract_text_nodes_as_mapping(html: str) -> Tuple[str, Dict[str, NodeInfo]]:
-    """Оборачивает текстовые узлы в <span data-hid="..."> и собирает mapping id->NodeInfo."""
+def extract_text_nodes_as_mapping(html: str) -> Tuple[str, Dict[str, str]]:
+    """Оборачивает текстовые узлы в <span data-hid="..."> и собирает mapping id->text."""
     soup = BeautifulSoup(html, "lxml")
-
     for bad in soup(["script", "style", "noscript"]):
         bad.extract()
 
     hid_counter = 0
-    mapping: Dict[str, NodeInfo] = {}
+    mapping: Dict[str, str] = {}
 
     def tag_text_nodes(t: Tag) -> None:
         nonlocal hid_counter
@@ -114,14 +66,12 @@ def extract_text_nodes_as_mapping(html: str) -> Tuple[str, Dict[str, NodeInfo]]:
                     span["data-hid"] = hid
                     span.string = text
                     child.replace_with(span)
-                    parent_tag = t.name.lower() if isinstance(t, Tag) and t.name else "div"
-                    mapping[hid] = NodeInfo(text=text, parent_tag=parent_tag)
+                    mapping[hid] = text
             elif isinstance(child, Tag):
                 tag_text_nodes(child)
 
     tag_text_nodes(soup.body or soup)
     return str(soup), mapping
-
 
 def replace_text_nodes_from_mapping(html_with_ids: str, replacements: Dict[str, str]) -> str:
     soup = BeautifulSoup(html_with_ids, "lxml")
@@ -129,201 +79,199 @@ def replace_text_nodes_from_mapping(html_with_ids: str, replacements: Dict[str, 
         hid = span.get("data-hid")
         if hid in replacements:
             span.string = replacements[hid]
-    # Удаляем служебные атрибуты
     for span in soup.find_all(attrs={"data-hid": True}):
         del span["data-hid"]
     return str(soup)
 
+def _safe_json_loads(maybe_json: str) -> Dict[str, str]:
+    """Парсит JSON-объект из ответа модели. Пытается найти первый {...} блок."""
+    try:
+        return json.loads(maybe_json)
+    except Exception:
+        pass
+    m = re.search(r"\{.*\}", maybe_json, flags=re.DOTALL)
+    if m:
+        try:
+            return json.loads(m.group(0))
+        except Exception:
+            pass
+    raise ValueError("Не удалось распарсить JSON из ответа модели.")
+
+def _word_count(s: str) -> int:
+    tokens = re.findall(r"\w+", s, flags=re.UNICODE)
+    return len(tokens)
+
+def append_words_marker_to_html(html: str, n: int) -> str:
+    """Добавляет в конец HTML видимый маркер [Words: N] как последний <p>."""
+    try:
+        soup = BeautifulSoup(html, "lxml")
+        container = soup.body or soup
+        p = soup.new_tag("p")
+        p.string = f"[Words: {n}]"
+        container.append(p)
+        return str(soup)
+    except Exception:
+        return f"{html}\n[Words: {n}]"
 
 # ----------------------------
-# Промпты (настраиваемые параметры)
+# Промпты (обновлённые)
 # ----------------------------
-PROMPT_PLAIN_TEXT_TPL = """You are an expert editor.
-Edit the text so it reads naturally for a native speaker while preserving the original meaning, structure, and tone.
 
-Language: use the SAME language as the input (auto-detect). Do NOT translate.
+# 1) Обычный текст → возвращаем ОТРЕДАКТИРОВАННЫЙ ТЕКСТ с [Words: N] в конце
+PROMPT_PLAIN_TEXT = """You are an expert human editor.
 
-Requirements:
-- Word count: keep within ±{wc_tol}% of the original. Append the final count as [Words: N].
-- Structure: keep paragraph breaks, headings, list order/numbering, and overall section order.
-- Formatting: keep punctuation, quotation marks, inline formatting (bold/italic/links/code), emojis, citation markers, and references.
-- Facts & entities: do not add, remove, or alter information. Keep names, numbers, dates, URLs, and titles unchanged.
-- Tone & register: preserve the author’s voice and level of formality.
-- Style tweaks: use idiomatic phrasing, reduce repetitiveness, vary sentence length, simplify clunky constructions—without changing emphasis or intent.
-- Non-text elements (code, formulas, tables): leave unchanged.
-- Return ONLY the edited text—no explanations, no metadata (besides [Words: N]).
+Goal
+- Make the text read like it was written by a human native speaker.
+- Keep meaning, facts, entities, URLs, numbers, dates, titles, and overall structure.
+
+Language
+- Use the SAME language as the input (auto-detect). Do NOT translate or normalize dialect/orthography.
+
+Constraints
+- Word count: keep within ±10% of the original. Append the final count as [Words: N].
+- Preserve paragraph breaks, headings, list order/numbering, and section order.
+- Preserve punctuation, quotation marks, inline formatting markers (bold/italic/links/code), emojis, citation markers, and references.
+
+Style targets (human-like)
+- Vary sentence length and rhythm; mix short and long sentences (“burstiness”).
+- Prefer specific, idiomatic phrasing over generic templates; avoid stock openings like “In conclusion,” “As we can see,” etc.
+- Use natural connectors (however, meanwhile, notably, still, that said, in fact, at times, for instance) but not in a repetitive pattern.
+- Keep the author’s voice and register; do not add opinions or new facts.
+
+Do NOT
+- Do not add or remove factual content.
+- Do not change any code blocks, formulas, or tables.
+
+Output
+- Return ONLY the edited text (no explanations, no code fences), with [Words: N] at the end.
 """
 
-PROMPT_PLAIN_TO_HTML_TPL = """You are an expert editor and HTML formatter.
-Edit the text so it reads naturally (same language) and then output clean, semantic HTML.
+# 2) Обычный текст → красивый семантический HTML И тоже добавить [Words: N] как последний <p>.
+PROMPT_PLAIN_TO_HTML = """You are an expert human editor and HTML formatter.
 
-Requirements:
-- Word count: keep within ±{wc_tol}% of the original. Append the final count as a visible last paragraph: [Words: N].
-- Preserve paragraph breaks, headings, list order/numbering, and section order (convert to HTML).
-- Preserve punctuation, quotes, inline emphasis/links/code semantics; convert markers to <strong>/<em>/<a>/<code>.
-- Do not alter facts, names, numbers, dates, URLs, or titles.
-- Keep the author’s voice; improve fluency without changing intent.
-- If the edited content contains at least one <table>, include at the VERY TOP a single <style> block:
+Goal
+- Make the text read like a human native speaker wrote it.
+- Then output clean, semantic HTML for the edited content.
+
+Language
+- Use the SAME language as the input (auto-detect). Do NOT translate or normalize dialect.
+
+Constraints
+- Word count: keep within ±10% of the original. Append the final count as the LAST paragraph: [Words: N].
+- Preserve paragraph breaks, headings, list order/numbering, and section order; convert to equivalent HTML.
+- Preserve punctuation, quotation marks, emphasis/links/code semantics; convert inline markers to <strong>/<em>/<a>/<code>.
+- Keep facts, names, numbers, dates, URLs, and titles intact.
+
+Style targets (human-like)
+- Vary sentence length and rhythm; avoid template phrasing and repetitive transitions.
+- Keep the author’s voice and register; improve fluency without changing intent.
+
+Tables
+- If there is at least one <table> in the edited content, include at the VERY TOP exactly one style block:
   <style>
   table { border-collapse: collapse; }
   table, th, td { border: 1px solid #000; }
   </style>
-- Non-text elements (code blocks, formulas, tables) should be kept as-is, wrapped in proper HTML tags if present.
-- Return ONLY the HTML markup. No markdown, no comments, no code fences.
-- Allowed tags: style (single block as above), p, h1..h4, ul/ol/li, blockquote, pre, code, a, strong, em, table/thead/tbody/tr/th/td, img (only if present), span.
+  Do not include any other CSS or inline styles.
+
+Non-text
+- Leave code blocks, formulas, tables as-is but wrap appropriately (<pre><code>, <table>, etc.) if present.
+
+Allowed tags
+- style (single block as above), p, h1..h4, ul/ol/li, blockquote, pre, code, a, strong, em,
+  table/thead/tbody/tr/th/td, img (only if present in input), span.
+
+Output
+- Return ONLY the HTML markup. No markdown, no comments, no code fences, no explanations.
 """
 
-PROMPT_HTML_JSON_TPL = """You are an expert micro-editor.
-You will receive a JSON object mapping {{id: text}} extracted from HTML text nodes.
-For each value: edit to read naturally while preserving meaning, structure, tone, punctuation and references.
-Use the SAME language as the value. Do NOT translate.
+# 3) HTML через JSON-замену (сохраняем исходную разметку 1:1); [Words: N] добавим в приложении.
+PROMPT_HTML_JSON = """You are an expert micro-editor.
 
-Constraints PER VALUE:
-- Word count: keep within ±{wc_tol}% of that value’s original length.
-- Absolutely DO NOT introduce or remove HTML tags; you are editing TEXT CONTENT ONLY.
-- Return ONLY a valid JSON object with the SAME KEYS and improved string values. No extra text.
+Input
+- You will receive a JSON object mapping {id: text}, extracted from HTML text nodes.
+- Edit each VALUE so it reads like natural human writing while keeping meaning and tone.
 
-Reference (do not include in JSON): here are parent tag names for each id to help with style.
-{{parents}}
+Language
+- Use the SAME language as each value (auto-detect). Do NOT translate or normalize dialect.
+
+Per-value constraints
+- Word count: keep within ±10% of that value’s original length.
+- Preserve punctuation, quotation marks, inline formatting markers present in the value,
+  emojis, citation markers, and references.
+- Absolutely DO NOT introduce or remove HTML tags (you edit TEXT ONLY).
+- Keep facts, names, numbers, dates, URLs, and titles unchanged.
+
+Style targets (human-like)
+- Vary rhythm (short/long sentences where applicable); avoid generic templates and clichés.
+- Maintain voice and register; do not add opinions or new information.
+
+Output format (strict)
+- Return ONLY a VALID JSON OBJECT with the SAME KEYS and improved string values.
+- No surrounding text, no code fences, no comments.
+- If any value is empty or whitespace, copy it unchanged.
+
+Begin by returning the JSON object for the provided mapping.
 """
 
 # ----------------------------
-# Работа с моделью
+# Работа с моделями
 # ----------------------------
-
-def _openai_client(api_key: str) -> OpenAI:
-    return OpenAI(api_key=api_key)
-
-
-def _call_openai_json_map(
-    client: OpenAI,
-    model: str,
-    mapping: Dict[str, NodeInfo],
-    wc_tol: int,
-    temperature: float,
-    top_p: float,
-    frequency_penalty: float,
-    presence_penalty: float,
-    seed: int | None = None,
-) -> Dict[str, str]:
-    """Вызывает модель в JSON-режиме батчами и возвращает объединённый dict id->text."""
-    # Готовим простые структуры
-    id_to_text = {k: v.text for k, v in mapping.items()}
-    id_to_parent = {k: v.parent_tag for k, v in mapping.items()}
-
-    # Батчинг по суммарной длине значений (символы), чтобы не упираться в лимит токенов
-    batches: List[List[str]] = []
-    current: List[str] = []
-    acc_len = 0
-    MAX_CHARS = 12000  # эмпирически безопасно для большинства моделей
-
-    for k, v in id_to_text.items():
-        add_len = len(k) + len(v) + 6
-        if acc_len + add_len > MAX_CHARS and current:
-            batches.append(current)
-            current = []
-            acc_len = 0
-        current.append(k)
-        acc_len += add_len
-    if current:
-        batches.append(current)
-
-    out: Dict[str, str] = {}
-
-    for i, batch_keys in enumerate(batches, 1):
-        sub_map = {k: id_to_text[k] for k in batch_keys}
-        parents_hint = {k: id_to_parent[k] for k in batch_keys}
-
-        prompt = PROMPT_HTML_JSON_TPL.format(wc_tol=wc_tol, parents=json.dumps(parents_hint, ensure_ascii=False))
-
-        # JSON-mode заставляет модель вернуть строго JSON
-        kwargs = dict(
-            model=model,
-            messages=[
-                {"role": "system", "content": "You are a careful, detail-oriented text editor."},
-                {"role": "user", "content": prompt},
-                {"role": "user", "content": json.dumps(sub_map, ensure_ascii=False)},
-            ],
-            temperature=temperature,
-            top_p=top_p,
-            frequency_penalty=frequency_penalty,
-            presence_penalty=presence_penalty,
-            response_format={"type": "json_object"},
-        )
-        if seed is not None:
-            kwargs["seed"] = seed
-
-        resp = client.chat.completions.create(**kwargs)
-        content = resp.choices[0].message.content or "{}"
-        try:
-            parsed = json.loads(content)
-        except Exception:
-            # Фолбэк на мягкий парсер
-            m = re.search(r"\{.*\}", content, flags=re.DOTALL)
-            if not m:
-                raise RuntimeError("Модель вернула не-JSON в батче %d" % i)
-            parsed = json.loads(m.group(0))
-
-        # sanity-check: все ключи на месте
-        for k in batch_keys:
-            if k not in parsed:
-                parsed[k] = sub_map[k]
-        out.update({k: str(parsed[k]) for k in batch_keys})
-
-    return out
-
-
-def _call_openai_text(
-    client: OpenAI,
-    model: str,
-    system_prompt: str,
-    user_text: str,
-    temperature: float,
-    top_p: float,
-    frequency_penalty: float,
-    presence_penalty: float,
-    seed: int | None = None,
-) -> str:
-    kwargs = dict(
-        model=model,
+def call_openai_json_map(api_key: str, mapping: Dict[str, str]) -> Dict[str, str]:
+    client = OpenAI(api_key=api_key)
+    resp = client.chat.completions.create(
+        model=MODEL_ID,
         messages=[
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_text},
+            {"role": "user", "content": PROMPT_HTML_JSON},
+            {"role": "user", "content": json.dumps(mapping, ensure_ascii=False)},
         ],
-        temperature=temperature,
-        top_p=top_p,
-        frequency_penalty=frequency_penalty,
-        presence_penalty=presence_penalty,
     )
-    if seed is not None:
-        kwargs["seed"] = seed
-    resp = client.chat.completions.create(**kwargs)
+    content = resp.choices[0].message.content or "{}"
+    return _safe_json_loads(content)
+
+def call_openai_rewrite_text(api_key: str, text: str) -> str:
+    """Обычный текст → отредактированный текст (+[Words: N])."""
+    client = OpenAI(api_key=api_key)
+    resp = client.chat.completions.create(
+        model=MODEL_ID,
+        messages=[
+            {"role": "user", "content": PROMPT_PLAIN_TEXT},
+            {"role": "user", "content": text},
+        ],
+    )
     return (resp.choices[0].message.content or "").strip()
 
+def call_openai_rewrite_text_to_html(api_key: str, text: str) -> str:
+    """Обычный текст → красивый семантический HTML с финальным <p>[Words: N]</p>."""
+    client = OpenAI(api_key=api_key)
+    resp = client.chat.completions.create(
+        model=MODEL_ID,
+        messages=[
+            {"role": "user", "content": PROMPT_PLAIN_TO_HTML},
+            {"role": "user", "content": text},
+        ],
+    )
+    return (resp.choices[0].message.content or "").strip()
 
 # ----------------------------
 # Загрузка файлов
 # ----------------------------
-
 def read_text_file(uploaded) -> str:
     raw = uploaded.read().decode("utf-8", errors="ignore")
     return raw
-
 
 def read_docx_file(uploaded) -> str:
     if Document is None:
         raise RuntimeError("Не установлен пакет python-docx. Установите: pip install python-docx")
     uploaded.seek(0)
     doc = Document(uploaded)
-    blocks: List[str] = []
+    blocks = []
     for p in doc.paragraphs:
-        if p.text is not None:
-            blocks.append(p.text)
+        blocks.append(p.text)
     for table in doc.tables:
         for row in table.rows:
             blocks.append("\t".join(cell.text for cell in row.cells))
     return "\n".join(block for block in blocks if block is not None)
-
 
 def read_doc_file(uploaded) -> str:
     if textract is None:
@@ -335,11 +283,9 @@ def read_doc_file(uploaded) -> str:
         data = textract.process(tmp.name)
     return data.decode("utf-8", errors="ignore")
 
-
 # ----------------------------
 # Генерация скачиваемых файлов
 # ----------------------------
-
 def build_docx_bytes(plain_text: str) -> bytes:
     if Document is None:
         raise RuntimeError("Для экспорта в .docx установите python-docx: pip install python-docx")
@@ -350,9 +296,8 @@ def build_docx_bytes(plain_text: str) -> bytes:
     doc.save(bio)
     return bio.getvalue()
 
-
 # ----------------------------
-# UI
+# UI: ввод и выходной формат
 # ----------------------------
 col_in, col_opts = st.columns([2, 1], gap="large")
 
@@ -365,7 +310,7 @@ with col_in:
     uploaded = st.file_uploader(
         "…или загрузите файл (.html, .txt, .md, .docx, .doc)",
         type=["html", "txt", "md", "docx", "doc"],
-        accept_multiple_files=False,
+        accept_multiple_files=False
     )
     if uploaded is not None and not input_text:
         ext = (uploaded.name.split(".")[-1] or "").lower()
@@ -384,63 +329,36 @@ with col_in:
             st.error(f"Не удалось прочитать файл: {e}")
 
 with col_opts:
-    st.markdown("#### Параметры модели")
-    api_key = st.text_input("OPENAI_API_KEY", value=API_KEY_DEFAULT, type="password")
-    model_id = st.text_input("Модель", value=MODEL_DEFAULT, help="Напр.: gpt-4o, gpt-4o-mini, gpt-5")
-
-    temperature = st.slider("temperature", 0.0, 1.5, 0.7, 0.1)
-    top_p        = st.slider("top_p",        0.1, 1.0, 1.0, 0.05)
-    freq_pen     = st.slider("frequency_penalty", -2.0, 2.0, 0.2, 0.1)
-    pres_pen     = st.slider("presence_penalty",  -2.0, 2.0, 0.0, 0.1)
-    seed_opt     = st.text_input("seed (опционально)", value="", help="Для воспроизводимости. Оставьте пустым для случайности.")
-    seed = int(seed_opt) if seed_opt.strip().isdigit() else None
-
     st.markdown("#### Выходной формат")
     out_format = st.radio("Формат выдачи", ["HTML", "Plain/Markdown"], index=0, horizontal=True)
-    add_words_marker = st.checkbox("Добавлять [Words: N] в конец", value=False)
-    wc_tol = st.slider("Допустимое изменение длины (±%)", 1, 20, 8)
-
     text_download_fmt = st.selectbox("Скачать текст как", ["TXT", "MD", "DOCX"], index=0, help="Применяется, когда результат — текст.")
-
     st.markdown("#### Обработать")
-    go = st.button("🚀 Запустить обработку", type="primary", use_container_width=True)
-
+    go = st.button("🚀 Запустить хуманизацию", type="primary", use_container_width=True)
 
 # ----------------------------
 # Основная логика
 # ----------------------------
 if go:
-    if not (input_text and input_text.strip()):
+    if not input_text or not input_text.strip():
         st.error("Пожалуйста, вставьте текст или загрузите файл.")
-    elif not api_key:
+    elif not API_KEY:
         st.error(
-            "Не найден OPENAI_API_KEY. Укажите его в Streamlit secrets (Settings → Secrets) или в переменной окружения."
+            "Не найден OPENAI_API_KEY. Укажите его в Streamlit secrets "
+            "(Settings → Secrets) или в переменной окружения."
         )
     else:
         try:
-            client = _openai_client(api_key)
             with st.spinner("Обработка текста моделью…"):
                 if is_html(input_text):
-                    # HTML → JSON-замена с батчингом (сохраняем исходные теги 1:1)
+                    # HTML → JSON-замена (сохраняем исходные теги 1:1). [Words: N] добавляем после сборки.
                     html_with_ids, mapping = extract_text_nodes_as_mapping(input_text)
-                    rewritten_map = _call_openai_json_map(
-                        client=client,
-                        model=model_id,
-                        mapping=mapping,
-                        wc_tol=wc_tol,
-                        temperature=temperature,
-                        top_p=top_p,
-                        frequency_penalty=freq_pen,
-                        presence_penalty=pres_pen,
-                        seed=seed,
-                    )
+                    rewritten_map = call_openai_json_map(API_KEY, mapping)
                     result_html = replace_text_nodes_from_mapping(html_with_ids, rewritten_map)
 
-                    # Считаем слова по видимому тексту
-                    if add_words_marker:
-                        visible_text = BeautifulSoup(result_html, "lxml").get_text(separator=" ").strip()
-                        words_n = _word_count(visible_text)
-                        result_html = append_words_marker_to_html(result_html, words_n)
+                    # Считаем слова по видимому тексту и добавляем маркер
+                    visible_text = BeautifulSoup(result_html, "lxml").get_text(separator=" ").strip()
+                    words_n = _word_count(visible_text)
+                    result_html = append_words_marker_to_html(result_html, words_n)
 
                     if out_format == "HTML":
                         result = result_html
@@ -448,31 +366,17 @@ if go:
                     else:
                         plain = BeautifulSoup(result_html, "lxml").get_text(separator="\n")
                         plain = re.sub(r"\n{3,}", "\n\n", plain).strip()
-                        if add_words_marker:
-                            # Для текста добавим маркер в конце отдельной строкой
-                            words_n = _word_count(plain)
-                            plain = f"{plain}\n[Words: {words_n}]"
                         result = plain
                         out_kind = "txt"
                 else:
                     # Обычный текст/Markdown
                     if out_format == "HTML":
-                        sys_prompt = PROMPT_PLAIN_TO_HTML_TPL.format(wc_tol=wc_tol)
-                        result = _call_openai_text(
-                            client, model_id, sys_prompt, input_text,
-                            temperature, top_p, freq_pen, pres_pen, seed
-                        )
+                        # Красивый HTML — просим модель также добавить [Words: N] как последний параграф.
+                        result = call_openai_rewrite_text_to_html(API_KEY, input_text)
                         out_kind = "html"
                     else:
-                        sys_prompt = PROMPT_PLAIN_TEXT_TPL.format(wc_tol=wc_tol)
-                        text_out = _call_openai_text(
-                            client, model_id, sys_prompt, input_text,
-                            temperature, top_p, freq_pen, pres_pen, seed
-                        )
-                        if not add_words_marker:
-                            # Если маркер отключён — удалим его, если модель всё же добавила
-                            text_out = re.sub(r"\s*\[Words:\s*\d+\]\s*$", "", text_out).rstrip()
-                        result = text_out
+                        # Отредактированный текст с [Words: N] в конце (добавляет модель)
+                        result = call_openai_rewrite_text(API_KEY, input_text)
                         out_kind = "txt"
 
             # Вывод и скачивание
@@ -519,5 +423,4 @@ if go:
                     except Exception as e:
                         st.error(f"Не удалось сформировать .docx: {e}")
         except Exception as e:
-            # Читаемая ошибка без лишних символов/мусора
             st.error(f"Ошибка обработки: {e}")
