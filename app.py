@@ -328,10 +328,4 @@ if btn_humanize_then_check:
 with st.expander("Как настроить Streamlit Secrets"):
     st.markdown(
         """
-**Локально** создайте файл `.streamlit/secrets.toml` рядом с `app.py`:
 
-```toml
-RYNE_USER_ID = "rk_live_XXXXXXXXXXXXXXXXXXXX"
-RYNE_API_BASE = "https://ryne.ai"
-RYNE_HUMANIZER_PATH = "/api/humanizer/models/supernova"
-RYNE_AI_SCORE_PATH = "/api/ai-score"
