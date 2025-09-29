@@ -1,56 +1,28 @@
 import os
 import io
 import json
-from typing import Optional, Tuple
+import re
+from typing import Tuple, Optional
 
 import streamlit as st
 import requests
+from bs4 import BeautifulSoup
+from docx import Document
 
-from bs4 import BeautifulSoup  # html обработка
-from docx import Document      # чтение .docx
 
-# ---------------------------
-# Настройки страницы
-# ---------------------------
-st.set_page_config(page_title="Ryne Humanizer — текст/HTML", layout="wide")
+# =============== Page config ===============
+st.set_page_config(page_title="Ryne — AI Score + Читабельность/HTML", layout="wide")
+st.title("Гуманизация для читабельности и HTML + AI Score (Ryne)")
 
-st.title("Гуманизация текста и HTML (через Ryne)")
+st.caption(
+    "⚠️ Этичное использование: приложение не предназначено для обхода AI-детекторов. "
+    "Оценка AI-следов выполняется через официальный API Ryne, а улучшение текста — локально для читабельности."
+)
 
-# --- Сайдбар: настройки API ---
-with st.sidebar:
-    st.header("API Ryne")
-    st.caption("Эти поля нужны, чтобы приложение могло дернуть ваш Ryne-эндпоинт.")
-    api_base = st.text_input("API Base URL", value=os.environ.get("RYNE_API_BASE", "https://ryne.ai"))
-    endpoint = st.text_input("Endpoint path", value=os.environ.get("RYNE_HUMANIZE_PATH", "/humanize"))
-    api_key = st.text_input("API Key (Bearer)", value=os.environ.get("RYNE_API_KEY", ""), type="password")
-    st.caption("⚠️ Параметры тела запроса ниже — пример. Проверь у Ryne фактический формат.")
-    req_text_field = st.text_input("JSON-поле для текста", value=os.environ.get("RYNE_TEXT_FIELD", "text"))
-    req_format_field = st.text_input("JSON-поле для формата", value=os.environ.get("RYNE_FORMAT_FIELD", "format"))
-    req_extra_json = st.text_area(
-        "Доп. JSON-поля (опционально)", 
-        value=os.environ.get("RYNE_EXTRA_JSON", ""),
-        placeholder='Напр.: {"temperature": 0.3, "style": "neutral"}'
-    )
 
-# --- Колонки как на скриншоте ---
-col_left, col_right = st.columns([2.2, 1.0])
-
-# ---------------------------
-# Ввод: текст/HTML или файл
-# ---------------------------
-with col_left:
-    st.subheader("Вставьте текст или HTML")
-    input_text = st.text_area(
-        "Вставьте сюда ваш текст / HTML. Результат вернёт Ryne (/humanize).",
-        height=300,
-        placeholder="Ваш текст или HTML…",
-    )
-
-    st.caption("…или загрузите файл (.html, .htm, .txt, .md, .docx)")
-    up_file = st.file_uploader("Drag & drop / Browse", type=["html", "htm", "txt", "md", "docx"])
-
+# =============== Helpers ===============
 def read_uploaded_text(file) -> Tuple[str, Optional[str]]:
-    """Возвращает (текст, детектированный_тип) из загруженного файла."""
+    """Возвращает текст и тип ('html' или 'text') из загруженного файла."""
     if file is None:
         return "", None
     name = file.name.lower()
@@ -64,145 +36,209 @@ def read_uploaded_text(file) -> Tuple[str, Optional[str]]:
         doc = Document(file)
         text = "\n".join(p.text for p in doc.paragraphs)
         return text, "text"
-    # на .doc лучше не рассчитывать — офлайн-конвертеров без системных зависимостей нет
+    # .doc не поддерживаем (нужны системные конвертеры)
     return "", None
 
-uploaded_text = ""
-uploaded_kind = None
+
+def html_to_visible_text(html: str) -> str:
+    try:
+        soup = BeautifulSoup(html, "html.parser")
+        return soup.get_text("\n")
+    except Exception:
+        return html
+
+
+def improve_readability(text: str) -> str:
+    """Простая локальная переработка для читабельности (без обхода детекторов)."""
+    # 1) пробелы
+    t = re.sub(r"[ \t]+", " ", text)
+    # 2) нормализация тире
+    t = t.replace(" - ", " — ")
+    # 3) разбиение длинных предложений
+    sentences = re.split(r"(?<=[.!?])\s+", t)
+    lines = []
+    for s in sentences:
+        s = s.strip()
+        if not s:
+            continue
+        if len(s) > 240:
+            parts = re.split(r",\s+", s)
+            buf, cur = [], 0
+            for p in parts:
+                if cur + len(p) > 120:
+                    lines.append(", ".join(buf).strip() + ".")
+                    buf, cur = [p], len(p)
+                else:
+                    buf.append(p)
+                    cur += len(p)
+            if buf:
+                lines.append(", ".join(buf).strip() + ".")
+        else:
+            lines.append(s)
+    t = "\n".join(lines)
+    # 4) лишние пустые строки
+    t = re.sub(r"\n{3,}", "\n\n", t).strip()
+    return t
+
+
+def text_to_html(text: str) -> str:
+    soup = BeautifulSoup("", "html.parser")
+    root = soup.new_tag("div", **{"class": "ryne-output"})
+    for para in text.split("\n"):
+        if not para.strip():
+            continue
+        p = soup.new_tag("p")
+        p.string = para.strip()
+        root.append(p)
+    return str(root)
+
+
+def call_ryne_ai_score(text: str, user_id_api_key: str) -> dict:
+    """Официальный публичный эндпоинт Ryne для оценки AI-следов."""
+    url = "https://ryne.ai/api/ai-score"
+    headers = {"Content-Type": "application/json"}
+    payload = {"text": text, "user_id": user_id_api_key}
+    resp = requests.post(url, headers=headers, json=payload, timeout=60)
+
+    # Диагностика
+    with st.expander("Диагностика ответа (AI Score)"):
+        st.write(
+            {
+                "status": resp.status_code,
+                "headers": dict(resp.headers),
+                "preview": resp.text[:1200],
+            }
+        )
+
+    resp.raise_for_status()
+    return resp.json()
+
+
+# =============== Layout ===============
+left, right = st.columns([2.2, 1.0])
+
+with left:
+    st.subheader("Вставьте текст или HTML")
+    input_text = st.text_area(
+        "Ваш текст или HTML…", height=300, placeholder="Вставьте сюда текст/HTML…"
+    )
+    st.caption("…или загрузите файл (.html, .htm, .txt, .md, .docx)")
+    up_file = st.file_uploader(
+        "Drag & drop / Browse", type=["html", "htm", "txt", "md", "docx"]
+    )
+
+uploaded_text, uploaded_kind = ("", None)
 if up_file is not None:
     uploaded_text, uploaded_kind = read_uploaded_text(up_file)
 
-# если пользователь и вставил текст, и загрузил файл — приоритет у файла
 source_text = uploaded_text or input_text
 
-# ---------------------------
-# Настройки выдачи
-# ---------------------------
-with col_right:
-    st.subheader("Выходной формат")
+with right:
+    st.subheader("Выходной формат для локальной переработки")
     out_fmt = st.radio("Формат выдачи", options=["HTML", "Plain/Markdown"], index=0)
-    download_as = st.selectbox("Скачать текст как", options=["TXT", "HTML", "MD"])
-    run = st.button("🚀 Запустить гуманизацию (Ryne)", type="primary")
+    download_as = st.selectbox("Скачать как", options=["HTML", "TXT", "MD"], index=0)
 
-# ---------------------------
-# Вызов Ryne
-# ---------------------------
-def call_ryne_humanize(text: str, output_format: str) -> str:
-    """
-    Шаблон запроса к Ryne.
-    !!! Проверь фактическую спецификацию у Ryne и поправь payload/headers !!!
-    """
-    if not api_base or not endpoint:
-        raise RuntimeError("Не задан API Base URL или endpoint.")
 
-    url = api_base.rstrip("/") + "/" + endpoint.lstrip("/")
-    headers = {"Content-Type": "application/json"}
-    if api_key:
-        headers["Authorization"] = f"Bearer {api_key}"
+# =============== Ryne AI Score ===============
+st.markdown("---")
+st.header("🔎 Проверка AI-следов через Ryne (официальный /api/ai-score)")
+api_key_body = st.text_input(
+    "Ryne API key (user_id)",
+    type="password",
+    help="Ключ передаётся в теле запроса как user_id.",
+)
+col_a, col_b = st.columns([1, 4])
+with col_a:
+    run_score = st.button("Проверить AI-score", type="primary")
 
-    payload = {req_text_field: text, req_format_field: ("html" if output_format == "HTML" else "text")}
-    # Доп. поля, если заданы
-    if req_extra_json.strip():
+if run_score:
+    if not source_text.strip():
+        st.warning("Нужно вставить текст/HTML или загрузить файл.")
+    elif not api_key_body.strip():
+        st.warning("Нужен Ryne API key (user_id).")
+    else:
+        # Если на входе HTML — оцениваем видимый текст
+        text_for_check = (
+            html_to_visible_text(source_text)
+            if ("<" in source_text and ">" in source_text)
+            else source_text
+        )
         try:
-            payload.update(json.loads(req_extra_json))
+            data = call_ryne_ai_score(text_for_check, api_key_body)
+            st.success("Оценка получена")
+
+            # Красивый вывод сводки
+            ai_score = data.get("aiScore")
+            classification = data.get("classification")
+            details = data.get("details") or {}
+            analysis = details.get("analysis") or {}
+            sentences = details.get("sentences") or []
+
+            cols = st.columns(3)
+            cols[0].metric("aiScore", ai_score)
+            cols[1].metric("classification", classification)
+            cols[2].metric("risk", analysis.get("risk"))
+
+            if analysis:
+                st.info(f"Рекомендация: {analysis.get('suggestion', '—')}")
+
+            if sentences:
+                st.subheader("По предложениям:")
+                for s in sentences:
+                    st.write(
+                        f"• **{s.get('text','')}** → aiProbability: {s.get('aiProbability')}, isAI: {s.get('isAI')}"
+                    )
         except Exception as e:
-            st.warning(f"Не удалось распарсить Доп. JSON-поля: {e}")
+            st.error(f"Ошибка при обращении к Ryne: {e}")
 
-    resp = requests.post(url, json=payload, timeout=60, headers=headers)
-    if resp.status_code != 200:
-        raise RuntimeError(f"Ryne вернул {resp.status_code}: {resp.text[:500]}")
-    # Предположим, что Ryne отдаёт ПЛОСКИЙ текст (string).
-    # Если приходит JSON — подстройся (например, resp.json()['result'])
-    try:
-        # если вдруг пришёл JSON с ключом result
-        j = resp.json()
-        if isinstance(j, dict) and "result" in j:
-            return str(j["result"])
-        # или если сразу text
-        if isinstance(j, dict) and "text" in j:
-            return str(j["text"])
-        # если неожиданная структура — вернём как строку
-        return json.dumps(j, ensure_ascii=False)
-    except Exception:
-        return resp.text
 
-# ---------------------------
-# Преобразование HTML (опционально)
-# ---------------------------
-def wrap_as_html(text: str) -> str:
-    """Если пользователь хочет HTML, но пришёл обычный текст — оборачиваем в простой HTML."""
-    soup = BeautifulSoup("", "html.parser")
-    body = soup.new_tag("div")
-    for para in text.split("\n"):
-        p = soup.new_tag("p")
-        p.string = para.strip()
-        body.append(p)
-    return str(body)
+# =============== Local readability/HTML ===============
+st.markdown("---")
+st.header("✨ Улучшение читабельности и HTML (локально)")
+run_local = st.button("Переписать для читабельности + HTML")
 
-def replace_text_nodes_keep_tags(html: str, new_text: str) -> str:
-    """
-    Вариант: если на входе HTML, а Ryne вернул plain-текст такого же объёма — 
-    можно просто заменить весь текст (упрощение).
-    Более продвинутый обход с разбором всех текстовых узлов можно добавить при желании.
-    """
-    # По умолчанию — оборачиваем как блок <div> с новым текстом
-    return wrap_as_html(new_text)
-
-# ---------------------------
-# Основной запуск
-# ---------------------------
-if run:
+if run_local:
     if not source_text.strip():
         st.warning("Нужно вставить текст/HTML или загрузить файл.")
     else:
-        with st.spinner("Обрабатываю через Ryne…"):
-            try:
-                result = call_ryne_humanize(source_text, out_fmt)
+        # Если пришёл HTML — извлекаем видимый текст и улучшаем его.
+        base_text = (
+            html_to_visible_text(source_text)
+            if ("<" in source_text and ">" in source_text)
+            else source_text
+        )
+        improved = improve_readability(base_text)
 
-                # Превью и подготовка к скачиванию
-                final_html = None
-                final_plain = None
-
-                # Если пользователь запросил HTML:
-                if out_fmt == "HTML":
-                    # Если исходник был HTML — попытаемся отрисовать как HTML.
-                    if (uploaded_kind == "html") or ("<html" in source_text.lower() or "<p" in source_text.lower()):
-                        # Если Ryne вернул HTML — покажем как есть, иначе завернём в простой HTML
-                        if "<" in result and ">" in result:
-                            final_html = result
-                        else:
-                            final_html = replace_text_nodes_keep_tags(source_text, result)
-                    else:
-                        # Исходник был текстом: превращаем в простой HTML-блок
-                        if "<" in result and ">" in result:
-                            final_html = result
-                        else:
-                            final_html = wrap_as_html(result)
-
-                    st.success("Готово! Ниже предпросмотр HTML.")
-                    st.components.v1.html(final_html, height=400, scrolling=True)
-
-                else:
-                    # Plain/Markdown выводим как есть
-                    final_plain = result
-                    st.success("Готово! Ниже результат (Plain/Markdown).")
-                    st.text_area("Результат", value=final_plain, height=300)
-
-                # Кнопка «Скачать»
-                fname = "result"
-                if download_as == "HTML":
-                    data = (final_html or wrap_as_html(final_plain or "")).encode("utf-8")
-                    st.download_button("⬇️ Скачать HTML", data=data, file_name=f"{fname}.html", mime="text/html")
-                elif download_as == "MD":
-                    data = (final_plain or "").encode("utf-8")
-                    st.download_button("⬇️ Скачать MD", data=data, file_name=f"{fname}.md", mime="text/markdown")
-                else:
-                    data = (final_plain or BeautifulSoup(final_html or "", "html.parser").get_text()).encode("utf-8")
-                    st.download_button("⬇️ Скачать TXT", data=data, file_name=f"{fname}.txt", mime="text/plain")
-
-            except Exception as e:
-                st.error(f"Ошибка при обращении к Ryne: {e}")
-                st.stop()
-
-# Подпись/подсказки
-st.caption("Примечание: приложение демонстрационное. Уточни фактический формат API у Ryne и подправь поля запроса в сайдбаре.")
+        if out_fmt == "HTML":
+            final_html = text_to_html(improved)
+            st.success("Готово. Ниже предпросмотр HTML.")
+            st.components.v1.html(final_html, height=420, scrolling=True)
+            # Скачивание
+            st.download_button(
+                "⬇️ Скачать HTML",
+                data=final_html.encode("utf-8"),
+                file_name="result.html",
+                mime="text/html",
+            )
+            st.download_button(
+                "⬇️ Скачать TXT",
+                data=improved.encode("utf-8"),
+                file_name="result.txt",
+                mime="text/plain",
+            )
+        else:
+            st.success("Готово. Ниже результат (Plain/Markdown).")
+            st.text_area("Результат", value=improved, height=300)
+            # Скачивание
+            st.download_button(
+                "⬇️ Скачать TXT",
+                data=improved.encode("utf-8"),
+                file_name="result.txt",
+                mime="text/plain",
+            )
+            st.download_button(
+                "⬇️ Скачать MD",
+                data=improved.encode("utf-8"),
+                file_name="result.md",
+                mime="text/markdown",
+            )
