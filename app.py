@@ -194,8 +194,10 @@ col_in, col_opts = st.columns([2, 1], gap="large")
 with col_in:
     st.markdown("#### Вставьте текст или HTML")
     input_text = st.text_area(
-        "", height=280,
+        "Входной текст",
+        height=280,
         placeholder="Вставьте сюда ваш текст / HTML. Результат вернёт Ryne /humanize.",
+        label_visibility="collapsed",
     )
     uploaded = st.file_uploader(
         "…или загрузите файл (.html, .txt, .md, .docx, .doc)",
@@ -275,7 +277,7 @@ if go:
                     st.code(result, language="html")
             else:
                 st.markdown("Предпросмотр текста:")
-                st.text_area("", value=result, height=400)
+                st.text_area("Предпросмотр текста", value=result, height=400, label_visibility="collapsed")
 
                 fmt = text_download_fmt.upper()
                 if fmt == "TXT":
