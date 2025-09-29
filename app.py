@@ -6,9 +6,10 @@ import re
 import tempfile
 from typing import Dict, Tuple
 
+import os
+import requests
 import streamlit as st
 from bs4 import BeautifulSoup, NavigableString, Tag
-from openai import OpenAI
 
 # --- опциональные импорты для офисных файлов ---
 try:
@@ -22,18 +23,29 @@ except Exception:
     textract = None
 
 # ----------------------------
-# Ключ и модель из Streamlit Secrets / окружения
+# Ключ и настройки Ryne API из Streamlit Secrets / окружения
 # ----------------------------
-import os
+RYNE_API_KEY = st.secrets.get("RYNE_API_KEY") or os.getenv("RYNE_API_KEY", "")
+# Можно переопределить URL эндпоинта в secrets: RYNE_API_URL = "https://ryne.ai/humanize"
+RYNE_API_URL = st.secrets.get("RYNE_API_URL", os.getenv("RYNE_API_URL", "https://ryne.ai/humanize"))
 
-API_KEY  = st.secrets.get("OPENAI_API_KEY") or os.getenv("OPENAI_API_KEY", "")
-MODEL_ID = st.secrets.get("OPENAI_MODEL", os.getenv("OPENAI_MODEL", "gpt-5"))
+# На случай, если поля в API отличаются, можно переопределить их через secrets
+RYNE_INPUT_FIELD = st.secrets.get("RYNE_INPUT_FIELD", os.getenv("RYNE_INPUT_FIELD", "input"))
+RYNE_FORMAT_FIELD = st.secrets.get("RYNE_FORMAT_FIELD", os.getenv("RYNE_FORMAT_FIELD", "format"))
+RYNE_OUTPUT_FIELD = st.secrets.get("RYNE_OUTPUT_FIELD", os.getenv("RYNE_OUTPUT_FIELD", "output"))
+
+# Дополнительные параметры к запросу (JSON), если нужны
+_extra_params_raw = st.secrets.get("RYNE_EXTRA_PARAMS", os.getenv("RYNE_EXTRA_PARAMS", ""))
+try:
+    RYNE_EXTRA_PARAMS = json.loads(_extra_params_raw) if _extra_params_raw else {}
+except Exception:
+    RYNE_EXTRA_PARAMS = {}
 
 # ----------------------------
 # Оформление
 # ----------------------------
-st.set_page_config(page_title="Humanizer — сохранение структуры", page_icon="🛠️", layout="wide")
-st.title("🛠️ Humanizer с сохранением структуры")
+st.set_page_config(page_title="Humanizer — Ryne API", page_icon="🛠️", layout="wide")
+st.title("🛠️ Humanizer (Ryne API)")
 
 # ----------------------------
 # Хелперы
@@ -45,61 +57,11 @@ def is_html(text: str) -> bool:
     has_angle = "</" in text or "/>" in text
     return has_tag and has_angle
 
-def extract_text_nodes_as_mapping(html: str) -> Tuple[str, Dict[str, str]]:
-    """Оборачивает текстовые узлы в <span data-hid="..."> и собирает mapping id->text."""
-    soup = BeautifulSoup(html, "lxml")
-    for bad in soup(["script", "style", "noscript"]):
-        bad.extract()
-
-    hid_counter = 0
-    mapping: Dict[str, str] = {}
-
-    def tag_text_nodes(t: Tag) -> None:
-        nonlocal hid_counter
-        for child in list(t.children):
-            if isinstance(child, NavigableString):
-                text = str(child)
-                if text and text.strip():
-                    hid_counter += 1
-                    hid = f"t{hid_counter}"
-                    span = soup.new_tag("span")
-                    span["data-hid"] = hid
-                    span.string = text
-                    child.replace_with(span)
-                    mapping[hid] = text
-            elif isinstance(child, Tag):
-                tag_text_nodes(child)
-
-    tag_text_nodes(soup.body or soup)
-    return str(soup), mapping
-
-def replace_text_nodes_from_mapping(html_with_ids: str, replacements: Dict[str, str]) -> str:
-    soup = BeautifulSoup(html_with_ids, "lxml")
-    for span in soup.find_all(attrs={"data-hid": True}):
-        hid = span.get("data-hid")
-        if hid in replacements:
-            span.string = replacements[hid]
-    for span in soup.find_all(attrs={"data-hid": True}):
-        del span["data-hid"]
-    return str(soup)
-
-def _safe_json_loads(maybe_json: str) -> Dict[str, str]:
-    """Парсит JSON-объект из ответа модели. Пытается найти первый {...} блок."""
-    try:
-        return json.loads(maybe_json)
-    except Exception:
-        pass
-    m = re.search(r"\{.*\}", maybe_json, flags=re.DOTALL)
-    if m:
-        try:
-            return json.loads(m.group(0))
-        except Exception:
-            pass
-    raise ValueError("Не удалось распарсить JSON из ответа модели.")
 
 def _word_count(s: str) -> int:
     tokens = re.findall(r"\w+", s, flags=re.UNICODE)
     return len(tokens)
+
 
 def append_words_marker_to_html(html: str, n: int) -> str:
     """Добавляет в конец HTML видимый маркер [Words: N] как последний <p>."""
@@ -113,145 +75,69 @@ def append_words_marker_to_html(html: str, n: int) -> str:
     except Exception:
         return f"{html}\n[Words: {n}]"
 
-# ----------------------------
-# Промпты (обновлённые)
-# ----------------------------
-
-# 1) Обычный текст → возвращаем ОТРЕДАКТИРОВАННЫЙ ТЕКСТ с [Words: N] в конце
-PROMPT_PLAIN_TEXT = """You are an expert human editor.
-
-Goal
-- Make the text read like it was written by a human native speaker.
-- Keep meaning, facts, entities, URLs, numbers, dates, titles, and overall structure.
-
-Language
-- Use the SAME language as the input (auto-detect). Do NOT translate or normalize dialect/orthography.
-
-Constraints
-- Word count: keep within ±10% of the original. Append the final count as [Words: N].
-- Preserve paragraph breaks, headings, list order/numbering, and section order.
-- Preserve punctuation, quotation marks, inline formatting markers (bold/italic/links/code), emojis, citation markers, and references.
-
-Style targets (human-like)
-- Vary sentence length and rhythm; mix short and long sentences (“burstiness”).
-- Prefer specific, idiomatic phrasing over generic templates; avoid stock openings like “In conclusion,” “As we can see,” etc.
-- Use natural connectors (however, meanwhile, notably, still, that said, in fact, at times, for instance) but not in a repetitive pattern.
-- Keep the author’s voice and register; do not add opinions or new facts.
-
-Do NOT
-- Do not add or remove factual content.
-- Do not change any code blocks, formulas, or tables.
-
-Output
-- Return ONLY the edited text (no explanations, no code fences), with [Words: N] at the end.
-"""
-
-# 2) Обычный текст → красивый семантический HTML И тоже добавить [Words: N] как последний <p>.
-PROMPT_PLAIN_TO_HTML = """You are an expert human editor and HTML formatter.
-
-Goal
-- Make the text read like a human native speaker wrote it.
-- Then output clean, semantic HTML for the edited content.
-
-Language
-- Use the SAME language as the input (auto-detect). Do NOT translate or normalize dialect.
-
-Constraints
-- Word count: keep within ±10% of the original. Append the final count as the LAST paragraph: [Words: N].
-- Preserve paragraph breaks, headings, list order/numbering, and section order; convert to equivalent HTML.
-- Preserve punctuation, quotation marks, emphasis/links/code semantics; convert inline markers to <strong>/<em>/<a>/<code>.
-- Keep facts, names, numbers, dates, URLs, and titles intact.
-
-Style targets (human-like)
-- Vary sentence length and rhythm; avoid template phrasing and repetitive transitions.
-- Keep the author’s voice and register; improve fluency without changing intent.
-
-Tables
-- If there is at least one <table> in the edited content, include at the VERY TOP exactly one style block:
-  <style>
-  table { border-collapse: collapse; }
-  table, th, td { border: 1px solid #000; }
-  </style>
-  Do not include any other CSS or inline styles.
-
-Non-text
-- Leave code blocks, formulas, tables as-is but wrap appropriately (<pre><code>, <table>, etc.) if present.
-
-Allowed tags
-- style (single block as above), p, h1..h4, ul/ol/li, blockquote, pre, code, a, strong, em,
-  table/thead/tbody/tr/th/td, img (only if present in input), span.
-
-Output
-- Return ONLY the HTML markup. No markdown, no comments, no code fences, no explanations.
-"""
-
-# 3) HTML через JSON-замену (сохраняем исходную разметку 1:1); [Words: N] добавим в приложении.
-PROMPT_HTML_JSON = """You are an expert micro-editor.
-
-Input
-- You will receive a JSON object mapping {id: text}, extracted from HTML text nodes.
-- Edit each VALUE so it reads like natural human writing while keeping meaning and tone.
-
-Language
-- Use the SAME language as each value (auto-detect). Do NOT translate or normalize dialect.
-
-Per-value constraints
-- Word count: keep within ±10% of that value’s original length.
-- Preserve punctuation, quotation marks, inline formatting markers present in the value,
-  emojis, citation markers, and references.
-- Absolutely DO NOT introduce or remove HTML tags (you edit TEXT ONLY).
-- Keep facts, names, numbers, dates, URLs, and titles unchanged.
-
-Style targets (human-like)
-- Vary rhythm (short/long sentences where applicable); avoid generic templates and clichés.
-- Maintain voice and register; do not add opinions or new information.
-
-Output format (strict)
-- Return ONLY a VALID JSON OBJECT with the SAME KEYS and improved string values.
-- No surrounding text, no code fences, no comments.
-- If any value is empty or whitespace, copy it unchanged.
-
-Begin by returning the JSON object for the provided mapping.
-"""
 
 # ----------------------------
-# Работа с моделями
+# Обёртка над Ryne /humanize
 # ----------------------------
-def call_openai_json_map(api_key: str, mapping: Dict[str, str]) -> Dict[str, str]:
-    client = OpenAI(api_key=api_key)
-    resp = client.chat.completions.create(
-        model=MODEL_ID,
-        messages=[
-            {"role": "user", "content": PROMPT_HTML_JSON},
-            {"role": "user", "content": json.dumps(mapping, ensure_ascii=False)},
-        ],
-    )
-    content = resp.choices[0].message.content or "{}"
-    return _safe_json_loads(content)
+def ryne_humanize(text: str, output_format: str = "text") -> str:
+    """
+    Вызывает Ryne /humanize и возвращает результат.
+    output_format: "text" | "html"
 
-def call_openai_rewrite_text(api_key: str, text: str) -> str:
-    """Обычный текст → отредактированный текст (+[Words: N])."""
-    client = OpenAI(api_key=api_key)
-    resp = client.chat.completions.create(
-        model=MODEL_ID,
-        messages=[
-            {"role": "user", "content": PROMPT_PLAIN_TEXT},
-            {"role": "user", "content": text},
-        ],
-    )
-    return (resp.choices[0].message.content or "").strip()
+    Поля запроса/ответа настраиваются через секреты RYNE_*_FIELD.
+    Доп. параметры можно передать через RYNE_EXTRA_PARAMS (JSON в secrets).
+    """
+    if not RYNE_API_KEY:
+        raise RuntimeError(
+            "Не найден RYNE_API_KEY. Укажите его в Streamlit secrets или переменной окружения."
+        )
 
-def call_openai_rewrite_text_to_html(api_key: str, text: str) -> str:
-    """Обычный текст → красивый семантический HTML с финальным <p>[Words: N]</p>."""
-    client = OpenAI(api_key=api_key)
-    resp = client.chat.completions.create(
-        model=MODEL_ID,
-        messages=[
-            {"role": "user", "content": PROMPT_PLAIN_TO_HTML},
-            {"role": "user", "content": text},
-        ],
-    )
-    return (resp.choices[0].message.content or "").strip()
+    headers = {
+        "Authorization": f"Bearer {RYNE_API_KEY}",
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+    }
+
+    payload: Dict[str, object] = {
+        RYNE_INPUT_FIELD: text,
+        RYNE_FORMAT_FIELD: output_format,
+    }
+    # Подмешиваем любые доп. параметры
+    if isinstance(RYNE_EXTRA_PARAMS, dict):
+        payload.update(RYNE_EXTRA_PARAMS)
+
+    resp = requests.post(RYNE_API_URL, headers=headers, json=payload, timeout=120)
+
+    # Бросаем осмысленные ошибки
+    try:
+        resp.raise_for_status()
+    except requests.HTTPError as http_err:
+        try:
+            err_json = resp.json()
+        except Exception:
+            err_json = {"detail": resp.text[:500]}
+        raise RuntimeError(f"Ryne API ошибка {resp.status_code}: {err_json}") from http_err
+
+    data = resp.json() if resp.content else {}
+
+    # Пытаемся извлечь ответ гибко
+    if isinstance(data, dict):
+        # основной путь через настраиваемое имя поля
+        out = data.get(RYNE_OUTPUT_FIELD)
+        if out:
+            return str(out)
+        # часто встречающиеся альтернативы
+        for key in ("result", "data", "text", "html"):
+            if key in data:
+                val = data[key]
+                # если data -> внутри может лежать output
+                if isinstance(val, dict):
+                    return str(val.get("output") or val.get("text") or val.get("html") or "")
+                return str(val)
+
+    # если не разобрались — пробуем как есть
+    return resp.text
+
 
 # ----------------------------
 # Загрузка файлов
@@ -259,6 +145,7 @@ def call_openai_rewrite_text_to_html(api_key: str, text: str) -> str:
 def read_text_file(uploaded) -> str:
     raw = uploaded.read().decode("utf-8", errors="ignore")
     return raw
+
 
 def read_docx_file(uploaded) -> str:
     if Document is None:
@@ -273,6 +160,7 @@ def read_docx_file(uploaded) -> str:
             blocks.append("\t".join(cell.text for cell in row.cells))
     return "\n".join(block for block in blocks if block is not None)
 
+
 def read_doc_file(uploaded) -> str:
     if textract is None:
         raise RuntimeError("Для чтения .doc установите textract: pip install textract")
@@ -282,6 +170,7 @@ def read_doc_file(uploaded) -> str:
         tmp.flush()
         data = textract.process(tmp.name)
     return data.decode("utf-8", errors="ignore")
+
 
 # ----------------------------
 # Генерация скачиваемых файлов
@@ -296,6 +185,7 @@ def build_docx_bytes(plain_text: str) -> bytes:
     doc.save(bio)
     return bio.getvalue()
 
+
 # ----------------------------
 # UI: ввод и выходной формат
 # ----------------------------
@@ -305,7 +195,7 @@ with col_in:
     st.markdown("#### Вставьте текст или HTML")
     input_text = st.text_area(
         "", height=280,
-        placeholder="Вставьте сюда ваш текст / HTML. Структура и порядок элементов будут сохранены.",
+        placeholder="Вставьте сюда ваш текст / HTML. Результат вернёт Ryne /humanize.",
     )
     uploaded = st.file_uploader(
         "…или загрузите файл (.html, .txt, .md, .docx, .doc)",
@@ -333,7 +223,7 @@ with col_opts:
     out_format = st.radio("Формат выдачи", ["HTML", "Plain/Markdown"], index=0, horizontal=True)
     text_download_fmt = st.selectbox("Скачать текст как", ["TXT", "MD", "DOCX"], index=0, help="Применяется, когда результат — текст.")
     st.markdown("#### Обработать")
-    go = st.button("🚀 Запустить хуманизацию", type="primary", use_container_width=True)
+    go = st.button("🚀 Запустить хуманизацию (Ryne)", type="primary", use_container_width=True)
 
 # ----------------------------
 # Основная логика
@@ -341,43 +231,34 @@ with col_opts:
 if go:
     if not input_text or not input_text.strip():
         st.error("Пожалуйста, вставьте текст или загрузите файл.")
-    elif not API_KEY:
+    elif not RYNE_API_KEY:
         st.error(
-            "Не найден OPENAI_API_KEY. Укажите его в Streamlit secrets "
-            "(Settings → Secrets) или в переменной окружения."
+            "Не найден RYNE_API_KEY. Укажите его в Streamlit secrets (Settings → Secrets) или в переменной окружения."
         )
     else:
         try:
-            with st.spinner("Обработка текста моделью…"):
-                if is_html(input_text):
-                    # HTML → JSON-замена (сохраняем исходные теги 1:1). [Words: N] добавляем после сборки.
-                    html_with_ids, mapping = extract_text_nodes_as_mapping(input_text)
-                    rewritten_map = call_openai_json_map(API_KEY, mapping)
-                    result_html = replace_text_nodes_from_mapping(html_with_ids, rewritten_map)
-
-                    # Считаем слова по видимому тексту и добавляем маркер
-                    visible_text = BeautifulSoup(result_html, "lxml").get_text(separator=" ").strip()
-                    words_n = _word_count(visible_text)
-                    result_html = append_words_marker_to_html(result_html, words_n)
-
-                    if out_format == "HTML":
-                        result = result_html
-                        out_kind = "html"
-                    else:
-                        plain = BeautifulSoup(result_html, "lxml").get_text(separator="\n")
-                        plain = re.sub(r"\n{3,}", "\n\n", plain).strip()
-                        result = plain
-                        out_kind = "txt"
+            with st.spinner("Отправка в Ryne /humanize…"):
+                # Вызываем один эндпоинт с нужным форматом
+                if out_format == "HTML":
+                    result = ryne_humanize(input_text, output_format="html")
+                    out_kind = "html"
                 else:
-                    # Обычный текст/Markdown
-                    if out_format == "HTML":
-                        # Красивый HTML — просим модель также добавить [Words: N] как последний параграф.
-                        result = call_openai_rewrite_text_to_html(API_KEY, input_text)
-                        out_kind = "html"
-                    else:
-                        # Отредактированный текст с [Words: N] в конце (добавляет модель)
-                        result = call_openai_rewrite_text(API_KEY, input_text)
-                        out_kind = "txt"
+                    result = ryne_humanize(input_text, output_format="text")
+                    out_kind = "txt"
+
+            # Добавляем [Words: N] локально, если его нет
+            try:
+                if out_kind == "html":
+                    visible_text = BeautifulSoup(result, "lxml").get_text(separator=" ").strip()
+                    words_n = _word_count(visible_text)
+                    if not re.search(r"\[Words:\s*\d+\]\s*$", result):
+                        result = append_words_marker_to_html(result, words_n)
+                else:
+                    words_n = _word_count(result)
+                    if not re.search(r"\[Words:\s*\d+\]\s*$", result):
+                        result = f"{result}\n[Words: {words_n}]"
+            except Exception:
+                pass
 
             # Вывод и скачивание
             st.success("Готово!")
