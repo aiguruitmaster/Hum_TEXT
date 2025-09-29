@@ -1,309 +1,208 @@
-from __future__ import annotations
-
+import os
 import io
 import json
-import re
-import tempfile
-from typing import Dict, Tuple
+from typing import Optional, Tuple
 
-import os
-import requests
 import streamlit as st
-from bs4 import BeautifulSoup, NavigableString, Tag
+import requests
 
-# --- опциональные импорты для офисных файлов ---
-try:
-    from docx import Document  # .docx
-except Exception:
-    Document = None
+from bs4 import BeautifulSoup  # html обработка
+from docx import Document      # чтение .docx
 
-try:
-    import textract  # .doc (если установлен и есть системные зависимости)
-except Exception:
-    textract = None
+# ---------------------------
+# Настройки страницы
+# ---------------------------
+st.set_page_config(page_title="Ryne Humanizer — текст/HTML", layout="wide")
 
-# ----------------------------
-# Ключ и настройки Ryne API из Streamlit Secrets / окружения
-# ----------------------------
-RYNE_API_KEY = st.secrets.get("RYNE_API_KEY") or os.getenv("RYNE_API_KEY", "")
-# Можно переопределить URL эндпоинта в secrets: RYNE_API_URL = "https://ryne.ai/humanize"
-RYNE_API_URL = st.secrets.get("RYNE_API_URL", os.getenv("RYNE_API_URL", "https://ryne.ai/humanize"))
+st.title("Гуманизация текста и HTML (через Ryne)")
 
-# На случай, если поля в API отличаются, можно переопределить их через secrets
-RYNE_INPUT_FIELD = st.secrets.get("RYNE_INPUT_FIELD", os.getenv("RYNE_INPUT_FIELD", "input"))
-RYNE_FORMAT_FIELD = st.secrets.get("RYNE_FORMAT_FIELD", os.getenv("RYNE_FORMAT_FIELD", "format"))
-RYNE_OUTPUT_FIELD = st.secrets.get("RYNE_OUTPUT_FIELD", os.getenv("RYNE_OUTPUT_FIELD", "output"))
+# --- Сайдбар: настройки API ---
+with st.sidebar:
+    st.header("API Ryne")
+    st.caption("Эти поля нужны, чтобы приложение могло дернуть ваш Ryne-эндпоинт.")
+    api_base = st.text_input("API Base URL", value=os.environ.get("RYNE_API_BASE", "https://ryne.ai"))
+    endpoint = st.text_input("Endpoint path", value=os.environ.get("RYNE_HUMANIZE_PATH", "/humanize"))
+    api_key = st.text_input("API Key (Bearer)", value=os.environ.get("RYNE_API_KEY", ""), type="password")
+    st.caption("⚠️ Параметры тела запроса ниже — пример. Проверь у Ryne фактический формат.")
+    req_text_field = st.text_input("JSON-поле для текста", value=os.environ.get("RYNE_TEXT_FIELD", "text"))
+    req_format_field = st.text_input("JSON-поле для формата", value=os.environ.get("RYNE_FORMAT_FIELD", "format"))
+    req_extra_json = st.text_area(
+        "Доп. JSON-поля (опционально)", 
+        value=os.environ.get("RYNE_EXTRA_JSON", ""),
+        placeholder='Напр.: {"temperature": 0.3, "style": "neutral"}'
+    )
 
-# Дополнительные параметры к запросу (JSON), если нужны
-_extra_params_raw = st.secrets.get("RYNE_EXTRA_PARAMS", os.getenv("RYNE_EXTRA_PARAMS", ""))
-try:
-    RYNE_EXTRA_PARAMS = json.loads(_extra_params_raw) if _extra_params_raw else {}
-except Exception:
-    RYNE_EXTRA_PARAMS = {}
+# --- Колонки как на скриншоте ---
+col_left, col_right = st.columns([2.2, 1.0])
 
-# ----------------------------
-# Оформление
-# ----------------------------
-st.set_page_config(page_title="Humanizer — Ryne API", page_icon="🛠️", layout="wide")
-st.title("🛠️ Humanizer (Ryne API)")
-
-# ----------------------------
-# Хелперы
-# ----------------------------
-def is_html(text: str) -> bool:
-    if not text:
-        return False
-    has_tag = bool(re.search(r"<([a-zA-Z][^>]*?)>", text))
-    has_angle = "</" in text or "/>" in text
-    return has_tag and has_angle
-
-
-def _word_count(s: str) -> int:
-    tokens = re.findall(r"\w+", s, flags=re.UNICODE)
-    return len(tokens)
-
-
-def append_words_marker_to_html(html: str, n: int) -> str:
-    """Добавляет в конец HTML видимый маркер [Words: N] как последний <p>."""
-    try:
-        soup = BeautifulSoup(html, "lxml")
-        container = soup.body or soup
-        p = soup.new_tag("p")
-        p.string = f"[Words: {n}]"
-        container.append(p)
-        return str(soup)
-    except Exception:
-        return f"{html}\n[Words: {n}]"
-
-
-# ----------------------------
-# Обёртка над Ryne /humanize
-# ----------------------------
-def ryne_humanize(text: str, output_format: str = "text") -> str:
-    """
-    Вызывает Ryne /humanize и возвращает результат.
-    output_format: "text" | "html"
-
-    Поля запроса/ответа настраиваются через секреты RYNE_*_FIELD.
-    Доп. параметры можно передать через RYNE_EXTRA_PARAMS (JSON в secrets).
-    """
-    if not RYNE_API_KEY:
-        raise RuntimeError(
-            "Не найден RYNE_API_KEY. Укажите его в Streamlit secrets или переменной окружения."
-        )
-
-    headers = {
-        "Authorization": f"Bearer {RYNE_API_KEY}",
-        "Content-Type": "application/json",
-        "Accept": "application/json",
-    }
-
-    payload: Dict[str, object] = {
-        RYNE_INPUT_FIELD: text,
-        RYNE_FORMAT_FIELD: output_format,
-    }
-    # Подмешиваем любые доп. параметры
-    if isinstance(RYNE_EXTRA_PARAMS, dict):
-        payload.update(RYNE_EXTRA_PARAMS)
-
-    resp = requests.post(RYNE_API_URL, headers=headers, json=payload, timeout=120)
-
-    # Бросаем осмысленные ошибки
-    try:
-        resp.raise_for_status()
-    except requests.HTTPError as http_err:
-        try:
-            err_json = resp.json()
-        except Exception:
-            err_json = {"detail": resp.text[:500]}
-        raise RuntimeError(f"Ryne API ошибка {resp.status_code}: {err_json}") from http_err
-
-    data = resp.json() if resp.content else {}
-
-    # Пытаемся извлечь ответ гибко
-    if isinstance(data, dict):
-        # основной путь через настраиваемое имя поля
-        out = data.get(RYNE_OUTPUT_FIELD)
-        if out:
-            return str(out)
-        # часто встречающиеся альтернативы
-        for key in ("result", "data", "text", "html"):
-            if key in data:
-                val = data[key]
-                # если data -> внутри может лежать output
-                if isinstance(val, dict):
-                    return str(val.get("output") or val.get("text") or val.get("html") or "")
-                return str(val)
-
-    # если не разобрались — пробуем как есть
-    return resp.text
-
-
-# ----------------------------
-# Загрузка файлов
-# ----------------------------
-def read_text_file(uploaded) -> str:
-    raw = uploaded.read().decode("utf-8", errors="ignore")
-    return raw
-
-
-def read_docx_file(uploaded) -> str:
-    if Document is None:
-        raise RuntimeError("Не установлен пакет python-docx. Установите: pip install python-docx")
-    uploaded.seek(0)
-    doc = Document(uploaded)
-    blocks = []
-    for p in doc.paragraphs:
-        blocks.append(p.text)
-    for table in doc.tables:
-        for row in table.rows:
-            blocks.append("\t".join(cell.text for cell in row.cells))
-    return "\n".join(block for block in blocks if block is not None)
-
-
-def read_doc_file(uploaded) -> str:
-    if textract is None:
-        raise RuntimeError("Для чтения .doc установите textract: pip install textract")
-    uploaded.seek(0)
-    with tempfile.NamedTemporaryFile(suffix=".doc", delete=True) as tmp:
-        tmp.write(uploaded.read())
-        tmp.flush()
-        data = textract.process(tmp.name)
-    return data.decode("utf-8", errors="ignore")
-
-
-# ----------------------------
-# Генерация скачиваемых файлов
-# ----------------------------
-def build_docx_bytes(plain_text: str) -> bytes:
-    if Document is None:
-        raise RuntimeError("Для экспорта в .docx установите python-docx: pip install python-docx")
-    doc = Document()
-    for para in plain_text.split("\n"):
-        doc.add_paragraph(para)
-    bio = io.BytesIO()
-    doc.save(bio)
-    return bio.getvalue()
-
-
-# ----------------------------
-# UI: ввод и выходной формат
-# ----------------------------
-col_in, col_opts = st.columns([2, 1], gap="large")
-
-with col_in:
-    st.markdown("#### Вставьте текст или HTML")
+# ---------------------------
+# Ввод: текст/HTML или файл
+# ---------------------------
+with col_left:
+    st.subheader("Вставьте текст или HTML")
     input_text = st.text_area(
-        "Входной текст",
-        height=280,
-        placeholder="Вставьте сюда ваш текст / HTML. Результат вернёт Ryne /humanize.",
-        label_visibility="collapsed",
+        "Вставьте сюда ваш текст / HTML. Результат вернёт Ryne (/humanize).",
+        height=300,
+        placeholder="Ваш текст или HTML…",
     )
-    uploaded = st.file_uploader(
-        "…или загрузите файл (.html, .txt, .md, .docx, .doc)",
-        type=["html", "txt", "md", "docx", "doc"],
-        accept_multiple_files=False
-    )
-    if uploaded is not None and not input_text:
-        ext = (uploaded.name.split(".")[-1] or "").lower()
+
+    st.caption("…или загрузите файл (.html, .htm, .txt, .md, .docx)")
+    up_file = st.file_uploader("Drag & drop / Browse", type=["html", "htm", "txt", "md", "docx"])
+
+def read_uploaded_text(file) -> Tuple[str, Optional[str]]:
+    """Возвращает (текст, детектированный_тип) из загруженного файла."""
+    if file is None:
+        return "", None
+    name = file.name.lower()
+    if name.endswith((".html", ".htm")):
+        data = file.read().decode("utf-8", errors="ignore")
+        return data, "html"
+    if name.endswith(".txt") or name.endswith(".md"):
+        data = file.read().decode("utf-8", errors="ignore")
+        return data, "text"
+    if name.endswith(".docx"):
+        doc = Document(file)
+        text = "\n".join(p.text for p in doc.paragraphs)
+        return text, "text"
+    # на .doc лучше не рассчитывать — офлайн-конвертеров без системных зависимостей нет
+    return "", None
+
+uploaded_text = ""
+uploaded_kind = None
+if up_file is not None:
+    uploaded_text, uploaded_kind = read_uploaded_text(up_file)
+
+# если пользователь и вставил текст, и загрузил файл — приоритет у файла
+source_text = uploaded_text or input_text
+
+# ---------------------------
+# Настройки выдачи
+# ---------------------------
+with col_right:
+    st.subheader("Выходной формат")
+    out_fmt = st.radio("Формат выдачи", options=["HTML", "Plain/Markdown"], index=0)
+    download_as = st.selectbox("Скачать текст как", options=["TXT", "HTML", "MD"])
+    run = st.button("🚀 Запустить гуманизацию (Ryne)", type="primary")
+
+# ---------------------------
+# Вызов Ryne
+# ---------------------------
+def call_ryne_humanize(text: str, output_format: str) -> str:
+    """
+    Шаблон запроса к Ryne.
+    !!! Проверь фактическую спецификацию у Ryne и поправь payload/headers !!!
+    """
+    if not api_base or not endpoint:
+        raise RuntimeError("Не задан API Base URL или endpoint.")
+
+    url = api_base.rstrip("/") + "/" + endpoint.lstrip("/")
+    headers = {"Content-Type": "application/json"}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+
+    payload = {req_text_field: text, req_format_field: ("html" if output_format == "HTML" else "text")}
+    # Доп. поля, если заданы
+    if req_extra_json.strip():
         try:
-            if ext in {"html", "htm"}:
-                input_text = read_text_file(uploaded)
-            elif ext in {"txt", "md"}:
-                input_text = read_text_file(uploaded)
-            elif ext == "docx":
-                input_text = read_docx_file(uploaded)
-            elif ext == "doc":
-                input_text = read_doc_file(uploaded)
-            else:
-                st.error("Неподдерживаемый формат файла.")
+            payload.update(json.loads(req_extra_json))
         except Exception as e:
-            st.error(f"Не удалось прочитать файл: {e}")
+            st.warning(f"Не удалось распарсить Доп. JSON-поля: {e}")
 
-with col_opts:
-    st.markdown("#### Выходной формат")
-    out_format = st.radio("Формат выдачи", ["HTML", "Plain/Markdown"], index=0, horizontal=True)
-    text_download_fmt = st.selectbox("Скачать текст как", ["TXT", "MD", "DOCX"], index=0, help="Применяется, когда результат — текст.")
-    st.markdown("#### Обработать")
-    go = st.button("🚀 Запустить хуманизацию (Ryne)", type="primary", use_container_width=True)
+    resp = requests.post(url, json=payload, timeout=60, headers=headers)
+    if resp.status_code != 200:
+        raise RuntimeError(f"Ryne вернул {resp.status_code}: {resp.text[:500]}")
+    # Предположим, что Ryne отдаёт ПЛОСКИЙ текст (string).
+    # Если приходит JSON — подстройся (например, resp.json()['result'])
+    try:
+        # если вдруг пришёл JSON с ключом result
+        j = resp.json()
+        if isinstance(j, dict) and "result" in j:
+            return str(j["result"])
+        # или если сразу text
+        if isinstance(j, dict) and "text" in j:
+            return str(j["text"])
+        # если неожиданная структура — вернём как строку
+        return json.dumps(j, ensure_ascii=False)
+    except Exception:
+        return resp.text
 
-# ----------------------------
-# Основная логика
-# ----------------------------
-if go:
-    if not input_text or not input_text.strip():
-        st.error("Пожалуйста, вставьте текст или загрузите файл.")
-    elif not RYNE_API_KEY:
-        st.error(
-            "Не найден RYNE_API_KEY. Укажите его в Streamlit secrets (Settings → Secrets) или в переменной окружения."
-        )
+# ---------------------------
+# Преобразование HTML (опционально)
+# ---------------------------
+def wrap_as_html(text: str) -> str:
+    """Если пользователь хочет HTML, но пришёл обычный текст — оборачиваем в простой HTML."""
+    soup = BeautifulSoup("", "html.parser")
+    body = soup.new_tag("div")
+    for para in text.split("\n"):
+        p = soup.new_tag("p")
+        p.string = para.strip()
+        body.append(p)
+    return str(body)
+
+def replace_text_nodes_keep_tags(html: str, new_text: str) -> str:
+    """
+    Вариант: если на входе HTML, а Ryne вернул plain-текст такого же объёма — 
+    можно просто заменить весь текст (упрощение).
+    Более продвинутый обход с разбором всех текстовых узлов можно добавить при желании.
+    """
+    # По умолчанию — оборачиваем как блок <div> с новым текстом
+    return wrap_as_html(new_text)
+
+# ---------------------------
+# Основной запуск
+# ---------------------------
+if run:
+    if not source_text.strip():
+        st.warning("Нужно вставить текст/HTML или загрузить файл.")
     else:
-        try:
-            with st.spinner("Отправка в Ryne /humanize…"):
-                # Вызываем один эндпоинт с нужным форматом
-                if out_format == "HTML":
-                    result = ryne_humanize(input_text, output_format="html")
-                    out_kind = "html"
-                else:
-                    result = ryne_humanize(input_text, output_format="text")
-                    out_kind = "txt"
-
-            # Добавляем [Words: N] локально, если его нет
+        with st.spinner("Обрабатываю через Ryne…"):
             try:
-                if out_kind == "html":
-                    visible_text = BeautifulSoup(result, "lxml").get_text(separator=" ").strip()
-                    words_n = _word_count(visible_text)
-                    if not re.search(r"\[Words:\s*\d+\]\s*$", result):
-                        result = append_words_marker_to_html(result, words_n)
+                result = call_ryne_humanize(source_text, out_fmt)
+
+                # Превью и подготовка к скачиванию
+                final_html = None
+                final_plain = None
+
+                # Если пользователь запросил HTML:
+                if out_fmt == "HTML":
+                    # Если исходник был HTML — попытаемся отрисовать как HTML.
+                    if (uploaded_kind == "html") or ("<html" in source_text.lower() or "<p" in source_text.lower()):
+                        # Если Ryne вернул HTML — покажем как есть, иначе завернём в простой HTML
+                        if "<" in result and ">" in result:
+                            final_html = result
+                        else:
+                            final_html = replace_text_nodes_keep_tags(source_text, result)
+                    else:
+                        # Исходник был текстом: превращаем в простой HTML-блок
+                        if "<" in result and ">" in result:
+                            final_html = result
+                        else:
+                            final_html = wrap_as_html(result)
+
+                    st.success("Готово! Ниже предпросмотр HTML.")
+                    st.components.v1.html(final_html, height=400, scrolling=True)
+
                 else:
-                    words_n = _word_count(result)
-                    if not re.search(r"\[Words:\s*\d+\]\s*$", result):
-                        result = f"{result}\n[Words: {words_n}]"
-            except Exception:
-                pass
+                    # Plain/Markdown выводим как есть
+                    final_plain = result
+                    st.success("Готово! Ниже результат (Plain/Markdown).")
+                    st.text_area("Результат", value=final_plain, height=300)
 
-            # Вывод и скачивание
-            st.success("Готово!")
-            if out_kind == "html":
-                st.markdown("Просмотр HTML:")
-                st.components.v1.html(result, height=600, scrolling=True)
-                st.download_button(
-                    label="⬇️ Скачать .html",
-                    data=result.encode("utf-8"),
-                    file_name="humanized.html",
-                    mime="text/html",
-                )
-                with st.expander("Показать HTML-код"):
-                    st.code(result, language="html")
-            else:
-                st.markdown("Предпросмотр текста:")
-                st.text_area("Предпросмотр текста", value=result, height=400, label_visibility="collapsed")
+                # Кнопка «Скачать»
+                fname = "result"
+                if download_as == "HTML":
+                    data = (final_html or wrap_as_html(final_plain or "")).encode("utf-8")
+                    st.download_button("⬇️ Скачать HTML", data=data, file_name=f"{fname}.html", mime="text/html")
+                elif download_as == "MD":
+                    data = (final_plain or "").encode("utf-8")
+                    st.download_button("⬇️ Скачать MD", data=data, file_name=f"{fname}.md", mime="text/markdown")
+                else:
+                    data = (final_plain or BeautifulSoup(final_html or "", "html.parser").get_text()).encode("utf-8")
+                    st.download_button("⬇️ Скачать TXT", data=data, file_name=f"{fname}.txt", mime="text/plain")
 
-                fmt = text_download_fmt.upper()
-                if fmt == "TXT":
-                    st.download_button(
-                        label="⬇️ Скачать .txt",
-                        data=result.encode("utf-8"),
-                        file_name="humanized.txt",
-                        mime="text/plain",
-                    )
-                elif fmt == "MD":
-                    st.download_button(
-                        label="⬇️ Скачать .md",
-                        data=result.encode("utf-8"),
-                        file_name="humanized.md",
-                        mime="text/markdown",
-                    )
-                elif fmt == "DOCX":
-                    try:
-                        docx_bytes = build_docx_bytes(result)
-                        st.download_button(
-                            label="⬇️ Скачать .docx",
-                            data=docx_bytes,
-                            file_name="humanized.docx",
-                            mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-                        )
-                    except Exception as e:
-                        st.error(f"Не удалось сформировать .docx: {e}")
-        except Exception as e:
-            st.error(f"Ошибка обработки: {e}")
+            except Exception as e:
+                st.error(f"Ошибка при обращении к Ryne: {e}")
+                st.stop()
+
+# Подпись/подсказки
+st.caption("Примечание: приложение демонстрационное. Уточни фактический формат API у Ryne и подправь поля запроса в сайдбаре.")
